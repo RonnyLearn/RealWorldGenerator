@@ -1,4 +1,4 @@
-# Real World — мод для Minecraft 26.3 (Fabric)
+# Real World Generator — мод для Minecraft 26.3 (Fabric)
 
 Кнопка **«Реальный мир»** в главном меню. За ней:
 
@@ -45,14 +45,17 @@ RealWorld/
 
 1. `tools\build-native.ps1`: собирает `arnis_native.dll` (Rust в `D:\Tools\rust`, MSVC Build Tools),
    около 10 минут в первый раз. Готовая библиотека в репозитории не хранится.
-2. В `mod\` выполнить `gradlew build`. Готовый мод: `mod\build\libs\real-world-1.0.0.jar`.
+2. В `mod\` выполнить `gradlew build`. Готовый мод: `mod\build\libs\real-world-generator-1.0.0.jar`.
 
 Нужны Minecraft 26.3, Fabric Loader ≥ 0.19.3, Fabric API и Windows x64: библиотека Arnis собрана
 под Windows.
 
 ## Лицензии и данные
 
-- Arnis © Louis Erbkamm, Apache-2.0. Файлы `LICENSE` и `NOTICE` Arnis лежат в jar
+- Real World Generator © RonnyLearn, все права защищены (All Rights Reserved), см. `LICENSE`.
+  Копировать, изменять и выкладывать мод или его код без разрешения автора нельзя.
+- Включает Arnis © Louis Erbkamm (Apache-2.0, с изменениями), папка `native/arnis` остаётся под этой
+  лицензией. Файлы `LICENSE` и `NOTICE` Arnis лежат в jar
   (`META-INF/licenses/arnis`). Изменения в коде Arnis помечены комментарием «Real World mod».
 - Карта и данные: © OpenStreetMap contributors (ODbL). Рельеф: © OpenTopoMap (CC-BY-SA).
   Спутник: © Esri, Maxar, Earthstar Geographics. Поиск мест: Nominatim (не чаще раза в секунду).

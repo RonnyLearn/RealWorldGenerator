@@ -9,4 +9,4 @@ pluginManagement {
 	}
 }
 
-rootProject.name = 'real-world'
+rootProject.name = 'real-world-generator'

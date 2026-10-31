@@ -2,15 +2,15 @@
 	"schemaVersion": 1,
 	"id": "realworld",
 	"version": "${version}",
-	"name": "Real World",
-	"description": "Pick any place on Earth and turn it into a Minecraft world, right from the main menu. World generation by Arnis (github.com/louis-e/arnis, Apache-2.0); map data © OpenStreetMap contributors.",
+	"name": "Real World Generator",
+	"description": "Pick any place on Earth and turn it into a Minecraft world, right from the main menu. © RonnyLearn, all rights reserved. Includes Arnis (© Louis Erbkamm, github.com/louis-e/arnis) under the Apache License 2.0, with changes; map data © OpenStreetMap contributors.",
 	"authors": [
 		"RonnyLearn"
 	],
 	"contributors": [
 		"Louis Erbkamm (Arnis world generator)"
 	],
-	"license": "Apache-2.0",
+	"license": "LicenseRef-All-Rights-Reserved",
 	"icon": "assets/realworld/icon.png",
 	"environment": "client",
 	"entrypoints": {

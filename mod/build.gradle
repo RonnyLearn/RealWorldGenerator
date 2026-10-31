@@ -6,7 +6,7 @@ version = project.mod_version
 group = project.maven_group
 
 base {
-	archivesName = 'real-world'
+	archivesName = 'real-world-generator'
 }
 
 dependencies {
@@ -49,5 +49,8 @@ jar {
 	from('../native/arnis') {
 		include 'LICENSE', 'NOTICE'
 		into 'META-INF/licenses/arnis'
+	}
+	from('../LICENSE') {
+		into 'META-INF'
 	}
 }
