@@ -1,0 +1,17 @@
+{
+	"required": true,
+	"package": "net.ronnylearn.realworld.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"CameraMixin",
+		"ConfirmScreenAccessor",
+		"HudMixin",
+		"LevelSummaryMixin",
+		"TestWindowMixin",
+		"WorldOpenFlowsMixin",
+		"ZombieMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

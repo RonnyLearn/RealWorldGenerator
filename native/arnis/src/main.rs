@@ -1,0 +1,926 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod args;
+mod bedrock_addon;
+mod bedrock_block_map;
+mod bench;
+mod biome;
+mod block_definitions;
+mod block_palette;
+mod bresenham;
+mod building_facades;
+mod canopy;
+mod caves;
+mod celestial;
+mod climate;
+mod clipping;
+mod colors;
+mod coordinate_system;
+mod data_processing;
+mod datapack;
+mod decals;
+mod deferred_placement;
+mod deterministic_rng;
+mod distant_horizons;
+mod ecoregion;
+mod element_processing;
+mod elevation;
+mod elevation_data;
+mod floodfill;
+mod floodfill_cache;
+mod geo_grid;
+mod grid_ops;
+mod ground;
+mod ground_decoration;
+mod ground_generation;
+mod land_cover;
+mod landmarks;
+mod luanti_block_map;
+mod map_item;
+mod map_item_palette;
+mod map_preview;
+mod map_renderer;
+mod map_transformation;
+mod mapillary;
+mod mode_filter;
+mod models_3d;
+mod net;
+mod one_world;
+mod ore_generation;
+mod osm_parser;
+mod osm_tiles;
+mod overture;
+#[cfg(feature = "gui")]
+mod preview_3d;
+#[cfg(feature = "gui")]
+mod progress;
+mod projection;
+mod retrieve_data;
+mod structures;
+#[cfg(feature = "gui")]
+mod telemetry;
+mod terrain_surface;
+#[cfg(test)]
+mod test_utilities;
+mod tile;
+mod trees;
+mod version_check;
+mod voxy;
+mod water_depth;
+mod water_steps;
+mod world_editor;
+mod world_utils;
+
+use args::Args;
+use clap::Parser;
+use colored::*;
+use std::path::PathBuf;
+#[cfg(all(feature = "gui", target_os = "linux"))]
+use std::process::Command;
+use std::{env, fs, io::Write};
+
+// mimalloc scales far better than the system allocator under the concurrent
+// 4 KiB section-vec / hashmap churn of tile-parallel processing.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "gui")]
+mod gui;
+
+// If the user does not want the GUI, it's easiest to just mock the progress module to do nothing
+#[cfg(not(feature = "gui"))]
+mod progress {
+    /// Mirrors the real module's constant so callers outside the GUI feature
+    /// still compile; nothing here reads it, the emits below do nothing.
+    pub const MESSAGE_ONLY: f64 = -1.0;
+    pub fn emit_gui_error(_message: &str) {}
+    pub fn emit_gui_progress_update(_progress: f64, _message: &str) {}
+    pub fn emit_gui_progress_update_ex(_progress: f64, _message: &str, _streaming: bool) {}
+    pub fn emit_map_preview_ready() {}
+    pub fn emit_show_in_folder(_path: &str) {}
+    pub fn is_running_with_gui() -> bool {
+        false
+    }
+}
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+
+#[cfg(all(feature = "gui", target_os = "linux"))]
+const EGL_ZINK_RETRY_MARKER: &str = "ARNIS_EGL_ZINK_RETRY";
+
+#[cfg(all(feature = "gui", target_os = "linux"))]
+fn has_user_rendering_override() -> bool {
+    [
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "LIBGL_ALWAYS_SOFTWARE",
+        "GALLIUM_DRIVER",
+    ]
+    .iter()
+    .any(|name| env::var_os(name).is_some())
+}
+
+#[cfg(all(feature = "gui", target_os = "linux"))]
+fn is_egl_startup_failure(error_message: &str) -> bool {
+    let lowered = error_message.to_ascii_lowercase();
+    lowered.contains("egl_not_initialized")
+        || lowered.contains("surfaceless egl")
+        || (lowered.contains("libegl") && lowered.contains("failed"))
+}
+
+#[cfg(all(feature = "gui", target_os = "linux"))]
+fn retry_gui_with_zink() -> Result<(), String> {
+    let executable = env::current_exe()
+        .map_err(|e| format!("Failed to locate current executable for EGL fallback retry: {e}"))?;
+    let status = Command::new(executable)
+        .env(EGL_ZINK_RETRY_MARKER, "1")
+        .env("MESA_LOADER_DRIVER_OVERRIDE", "zink")
+        .env("LIBGL_ALWAYS_SOFTWARE", "0")
+        .env("GALLIUM_DRIVER", "zink")
+        .status()
+        .map_err(|e| format!("Failed to relaunch with zink EGL workaround: {e}"))?;
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Reattach to the console this process was launched from, so terminal output
+/// works in both CLI and GUI runs.
+///
+/// Deliberately no `FreeConsole` first: a windows-subsystem process starts with
+/// no console of its own, so `AttachConsole` alone reaches the parent terminal.
+/// Freeing first can only invalidate the inherited handles, and a `FreeConsole`
+/// that succeeds followed by a reattach that fails leaves stdout/stderr pointing
+/// at a dead console, which turns every later `println!` into a panic.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// The One World a CLI run holds, and the folder if the run created it.
+struct OneWorldRun {
+    lock: world_utils::SessionLock,
+    created: Option<PathBuf>,
+}
+
+static ONE_WORLD_RUN: std::sync::Mutex<Option<OneWorldRun>> = std::sync::Mutex::new(None);
+
+/// Releases the One World lock. On failure a world this run created is removed.
+fn release_one_world(failed: bool) {
+    let run = ONE_WORLD_RUN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(OneWorldRun { lock, created }) = run {
+        drop(lock);
+        if let (true, Some(dir)) = (failed, created) {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// `process::exit` skips destructors, so failures go through here.
+fn exit_failed() -> ! {
+    release_one_world(true);
+    std::process::exit(1);
+}
+
+fn run_cli() {
+    // Configure thread pool with 90% CPU cap to keep system responsive
+    floodfill_cache::configure_rayon_thread_pool(0.9);
+
+    // Clean up old cached elevation tiles on startup
+    elevation_data::cleanup_old_cached_tiles();
+
+    let version: &str = env!("CARGO_PKG_VERSION");
+    let repository: &str = env!("CARGO_PKG_REPOSITORY");
+    println!(
+        r#"
+        ▄████████    ▄████████ ███▄▄▄▄    ▄█     ▄████████
+        ███    ███   ███    ███ ███▀▀▀██▄ ███    ███    ███
+        ███    ███   ███    ███ ███   ███ ███▌   ███    █▀
+        ███    ███  ▄███▄▄▄▄██▀ ███   ███ ███▌   ███
+      ▀███████████ ▀▀███▀▀▀▀▀   ███   ███ ███▌ ▀███████████
+        ███    ███ ▀███████████ ███   ███ ███           ███
+        ███    ███   ███    ███ ███   ███ ███     ▄█    ███
+        ███    █▀    ███    ███  ▀█   █▀  █▀    ▄████████▀
+                     ███    ███
+
+                          version {}
+                {}
+        "#,
+        version,
+        repository.bright_white().bold()
+    );
+
+    // Fire-and-forget update check; prints a one-line notice on a background thread.
+    version_check::check_for_updates_async();
+
+    // Parse input arguments
+    let mut args: Args = Args::parse();
+    args::apply_body_defaults(&mut args);
+    args::apply_feature_needs(&mut args);
+
+    // Validate arguments (path requirements differ between Java and Bedrock)
+    if let Err(e) = args::validate_args(&args) {
+        eprintln!("{}: {}", "Error".red().bold(), e);
+        std::process::exit(1);
+    }
+
+    // Cave zone-map mode renders the cave biome layout for --bbox and exits, before any world
+    // exists. It uses the same zone picker, seed and --cave-biomes amounts as --caves.
+    if args.cave_zone_map.is_some() {
+        if let Err(e) = caves::zone_map::render(&args) {
+            eprintln!("{}: {}", "Error".red().bold(), e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Open up the world floor before anything touches the editor. The bundled packs already
+    // grant the full engine range; without this the lower half of it goes unused. The ceiling
+    // goes with it: chunk serialization needs the whole dimension span, not just the floor.
+    world_editor::set_world_bounds(
+        ground::extended_min_y_for(&args),
+        ground::world_top_y_for(&args),
+    );
+
+    if args.legacy_terrain {
+        eprintln!(
+            "{} --terrain is deprecated: terrain is now on by default. \
+             Use --mode geo-only for flat ground.",
+            "Note:".yellow().bold()
+        );
+    }
+    // A run that loads no OSM data has nothing for the OSM in/out file args to act on.
+    if args.skip_osm() && (args.file.is_some() || args.save_json_file.is_some()) {
+        eprintln!(
+            "{} No OpenStreetMap data is loaded below scale 0.3 or off Earth; --file/--save-json-file are ignored.",
+            "Note:".yellow().bold()
+        );
+    }
+
+    // Resolve the effective bounding box ONCE, up front, and thread the concrete value to every
+    // consumer below (the CLI bbox is now optional). Precedence: explicit --bbox > file <bounds>
+    // element > node-coordinate extent.
+    //
+    // A local .osm/.xml file is the only bbox source when --bbox is omitted, so it must be loaded
+    // BEFORE the parallel fetch scope (Overture + land cover need the bbox) and before the bedrock
+    // world-name / area-size steps below. The parsed data is kept in `preloaded_osm` so the file
+    // isn't read twice. The Overpass and no-OSM paths already know the bbox from --bbox.
+    let skip_objects = args.skip_objects();
+    let skip_osm = args.skip_osm();
+    let (mut preloaded_osm, mut effective_bbox) = match (skip_osm, args.file.as_deref()) {
+        (false, Some(file)) => {
+            let (data, file_bounds) = match retrieve_data::fetch_data_from_file(file) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    eprintln!("{} Failed to load OSM file: {}", "Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
+            // Whole ways reach past the downloaded area, and One World would overwrite
+            // every chunk out to them.
+            if args.one_world && args.bbox.is_none() && file_bounds.is_none() {
+                eprintln!(
+                    "{} '{file}' has no bounds; --one-world needs --bbox, or the area would grow to every node in the file.",
+                    "Error:".red().bold()
+                );
+                std::process::exit(1);
+            }
+            let bbox = match osm_parser::resolve_bbox(args.bbox, file_bounds, &data) {
+                Some(bbox) => bbox,
+                None => {
+                    eprintln!(
+                        "{} could not derive a bounding box from '{file}' (no <bounds> element and no usable node extent); pass --bbox explicitly.",
+                        "Error:".red().bold()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            // Report where a derived bbox came from (an explicit --bbox is echoed by the parse step).
+            if args.bbox.is_none() {
+                let source = if file_bounds.is_some() {
+                    "the bounds in the file"
+                } else {
+                    "node coordinate extent"
+                };
+                println!(
+                    "Derived bounding box from {source}: {},{},{},{}",
+                    bbox.min().lat(),
+                    bbox.min().lng(),
+                    bbox.max().lat(),
+                    bbox.max().lng()
+                );
+            }
+            (Some(data), bbox)
+        }
+        _ => {
+            // Overpass or no OSM at all: --bbox is required (enforced by validate_args above).
+            let bbox = args.bbox.unwrap_or_else(|| {
+                eprintln!(
+                    "{} A bounding box is required. Provide --bbox, or --file with a local .osm/.xml file.",
+                    "Error:".red().bold()
+                );
+                std::process::exit(1);
+            });
+            (None, bbox)
+        }
+    };
+    // validate_args checks the spawn only against an explicit --bbox.
+    if let (None, Some(lat), Some(lng)) = (args.bbox, args.spawn_lat, args.spawn_lng) {
+        let inside = coordinate_system::geographic::LLPoint::new(lat, lng)
+            .is_ok_and(|p| effective_bbox.contains(&p));
+        if !inside {
+            eprintln!(
+                "{} Spawn point (--spawn-lat, --spawn-lng) must be within the bounding box.",
+                "Error:".red().bold()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // One World: snaps the bbox to the world's chunk grid and holds its lock.
+    let mut one_world_paths: Option<PathBuf> = None;
+    if args.one_world {
+        let base_dir = args.path.clone().unwrap_or_else(|| {
+            eprintln!(
+                "{} --one-world needs --output-dir (the saves folder).",
+                "Error:".red().bold()
+            );
+            std::process::exit(1);
+        });
+        let name = args
+            .world_name
+            .as_deref()
+            .and_then(world_utils::world_folder_name)
+            .unwrap_or_else(|| one_world::DEFAULT_WORLD_NAME.to_string());
+        let world_dir = base_dir.join(name);
+        let session =
+            one_world::prepare(&world_dir, &effective_bbox, &mut args).unwrap_or_else(|e| {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            });
+        effective_bbox = session.llbbox;
+        // The world decides the build height.
+        world_editor::set_world_bounds(
+            ground::extended_min_y_for(&args),
+            ground::world_top_y_for(&args),
+        );
+        *ONE_WORLD_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(OneWorldRun {
+            lock: session.lock,
+            created: session.created.then(|| world_dir.clone()),
+        });
+        if args.disable_height_limit && session.created {
+            if let Err(e) = world_utils::install_tall_datapack(&world_dir) {
+                eprintln!(
+                    "{} Failed to install tall-world datapack: {}",
+                    "Error:".red().bold(),
+                    e
+                );
+                exit_failed();
+            }
+        }
+        one_world_paths = Some(world_dir);
+    }
+    let args = args;
+
+    // Heads-up for very large areas: long, memory-heavy (about 6 GB here, the GUI's "very
+    // large" tier) and heavy on the public elevation servers. Non-blocking.
+    {
+        const MAX_RECOMMENDED_AREA_KM2: f64 = 200.0;
+        // area_km2 assumes Earth's radius, so a Moon bbox reads 13x too large.
+        let r = args.body.scale_ratio();
+        let area_km2 = effective_bbox.area_km2() * r * r;
+        // Blocks, and with them memory, grow with the square of the world scale.
+        let at_scale_1 = area_km2 * args.scale * args.scale;
+        // Earth only: the coarse fixed scale makes a large area the normal case.
+        if args.body.is_earth() && at_scale_1 > MAX_RECOMMENDED_AREA_KM2 {
+            eprintln!(
+                "{} Large area selected (~{:.0} km² at scale {:.2}). Generation may take \
+                 several minutes, use many GB of memory and place heavy load on public \
+                 elevation servers. Use a smaller area or scale if this was unintended.",
+                "Note:".yellow().bold(),
+                area_km2,
+                args.scale
+            );
+        }
+    }
+
+    // Determine world format and output path
+    let world_format = if args.bedrock {
+        world_editor::WorldFormat::BedrockMcWorld
+    } else if args.luanti {
+        world_editor::WorldFormat::LuantiWorld
+    } else {
+        world_editor::WorldFormat::JavaAnvil
+    };
+
+    // Before the downloads and a fresh world, with the run's final scale and options; the
+    // archive and Overpass both turn a box too large away. A One World this run made is
+    // already there and goes again with exit_failed.
+    let disk_dir = match (&one_world_paths, world_format) {
+        (Some(dir), _) => dir.clone(),
+        (None, world_editor::WorldFormat::BedrockMcWorld) => args
+            .path
+            .clone()
+            .unwrap_or_else(world_utils::get_bedrock_output_directory),
+        (None, world_editor::WorldFormat::LuantiWorld) => args
+            .path
+            .clone()
+            .unwrap_or_else(world_utils::get_luanti_worlds_directory),
+        (None, world_editor::WorldFormat::JavaAnvil) => args.path.clone().unwrap_or_default(),
+    };
+    if let Err(e) = world_utils::check_run_size(&args, &effective_bbox, world_format, &disk_dir) {
+        eprintln!("{} {}", "Error:".red().bold(), e.detail);
+        exit_failed();
+    }
+
+    // Build the generation output path and level name
+    let (generation_path, level_name) = if args.mapillary_probe {
+        // The probe reports coverage and exits, so it must not allocate (and
+        // leave behind) an empty world directory on the way there.
+        (PathBuf::new(), None)
+    } else if args.bedrock {
+        // Bedrock: generate .mcworld file in user-specified path or Desktop
+        let output_dir = args
+            .path
+            .clone()
+            .unwrap_or_else(world_utils::get_bedrock_output_directory);
+        let (output_path, lvl_name) =
+            world_utils::build_bedrock_output(&effective_bbox, output_dir, args.body);
+        (output_path, Some(lvl_name))
+    } else if args.luanti {
+        let base_dir = args
+            .path
+            .clone()
+            .unwrap_or_else(world_utils::get_luanti_worlds_directory);
+        let _ = std::fs::create_dir_all(&base_dir);
+        let mut counter = 1;
+        let world_name = loop {
+            let candidate = format!("Arnis Luanti World {counter}");
+            if !base_dir.join(&candidate).exists() {
+                break candidate;
+            }
+            counter += 1;
+        };
+        let world_path = base_dir.join(&world_name);
+        println!(
+            "Creating Luanti world at: {}",
+            world_path.display().to_string().bright_white().bold()
+        );
+        (world_path, Some(world_name))
+    } else if let Some(world_dir) = one_world_paths.clone() {
+        (world_dir, None)
+    } else {
+        // Java: create a new world in the provided output directory
+        let base_dir = args.path.clone().unwrap();
+        let world_path = match world_utils::create_new_world(&base_dir) {
+            Ok(path) => PathBuf::from(path),
+            Err(e) => {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        };
+        println!(
+            "Created new world at: {}",
+            world_path.display().to_string().bright_white().bold()
+        );
+        (world_path, None)
+    };
+
+    // Top-level phase timer (active only under --benchmark). generate_world has
+    // its own internal Bench for the block-placement phases.
+    let mut bench = bench::Bench::new(args.benchmark);
+
+    // A scale too small to render objects skips every object source: no Overpass query, no
+    // Overture footprints. Terrain-only still loads OSM, for its water and nature.
+    if args.skip_objects_due_to_scale() {
+        println!(
+            "{} Scale {:.2} is below {:.2}: skipping OpenStreetMap and Overture objects (terrain and land cover only)",
+            "[1/7]".bold(),
+            args.scale,
+            args::OBJECT_SKIP_SCALE
+        );
+    } else if skip_osm {
+        println!(
+            "{} No OpenStreetMap data off Earth: terrain only",
+            "[1/7]".bold()
+        );
+    } else if skip_objects {
+        println!(
+            "{} Terrain-only mode: keeping OpenStreetMap water and nature, no buildings or roads",
+            "[1/7]".bold()
+        );
+    }
+
+    // The Mapillary facade pipeline needs only the bbox too, and its downloads
+    // are the longest thing in a run that uses it, so it starts here and is
+    // collected inside `generate_world_with_options`, just before the buildings.
+    let facade_job = mapillary::FacadeJob::start(&args, effective_bbox);
+    if facade_job.is_running() {
+        println!(
+            "{} Fetching Mapillary street-level imagery...",
+            "  [+]".bold()
+        );
+    }
+
+    // OSM, Overture and elevation/land-cover fetches only need the bbox, so run them in parallel.
+    if args.overture && !skip_objects {
+        println!("{} Fetching Overture Maps data...", "  [+]".bold());
+    }
+    let fetch_start = std::time::Instant::now();
+    let (peak_tx, peaks) = crate::elevation::PeakSource::channel();
+    let (raw_data, overture_data, mut ground) = std::thread::scope(|s| {
+        // Owned here, so a panic below drops it and the terrain thread stops waiting.
+        let peak_tx = peak_tx;
+        let overture_handle = s.spawn(|| {
+            let t = std::time::Instant::now();
+            let data = if args.overture && !skip_objects {
+                overture::fetch_overture_buildings(
+                    &effective_bbox,
+                    &projection::ProjectionSpec::from_args(&args),
+                    args.overture_source,
+                    args.debug,
+                )
+            } else {
+                overture::OvertureData::default()
+            };
+            (data, t.elapsed())
+        });
+        let ground_handle = s.spawn(|| {
+            let t = std::time::Instant::now();
+            let ground = ground::generate_ground_data(&args, effective_bbox, &peaks);
+            (ground, t.elapsed())
+        });
+
+        let t = std::time::Instant::now();
+        // A local file was already parsed up front (to derive the bbox), so reuse that data.
+        // A run without OSM carries no objects. Otherwise fetch from Overpass, in parallel with
+        // the Overture and land-cover fetches spawned above.
+        let raw_data = if skip_osm {
+            osm_parser::OsmData::empty()
+        } else if let Some(data) = preloaded_osm.take() {
+            data
+        } else {
+            retrieve_data::fetch_osm_data(
+                effective_bbox,
+                args.scale,
+                args.debug,
+                args.downloader.as_str(),
+                args.save_json_file.as_deref(),
+                &args.osm_tiles_url,
+                !args.no_tile_archive,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("{} Failed to fetch data: {e}", "Error:".red().bold());
+                exit_failed();
+            })
+        };
+        bench.report("osm_fetch", t.elapsed());
+        // The terrain thread waits on this before fitting its height range. Overture's
+        // building heights follow once it is in, for the thread to wait on only if needed.
+        let _ = peak_tx.send(crate::elevation::TerrainHints::from_osm(&raw_data, &args));
+
+        // A panicked worker already reported itself through the panic hook, so
+        // degrade instead of taking the whole run down with it.
+        let (overture_data, overture_dur) = overture_handle.join().unwrap_or_else(|_| {
+            eprintln!(
+                "{} Overture fetch failed, continuing without Overture buildings.",
+                "Warning:".yellow().bold()
+            );
+            (overture::OvertureData::default(), std::time::Duration::ZERO)
+        });
+        bench.report("overture_fetch", overture_dur);
+        if crate::elevation::TerrainHints::wants_overture(&args) {
+            let _ = peak_tx.send(crate::elevation::TerrainHints::from_overture(
+                &raw_data,
+                &args,
+                &overture_data,
+            ));
+        }
+        // Nothing more follows, so a terrain thread still waiting is let go before the join.
+        drop(peak_tx);
+        let (ground, ground_dur) = ground_handle.join().unwrap_or_else(|_| {
+            eprintln!("{} Terrain fetch failed.", "Error:".red().bold());
+            exit_failed();
+        });
+        bench.report("terrain_total", ground_dur);
+
+        (raw_data, overture_data, ground)
+    });
+    bench.report("fetch_total", fetch_start.elapsed());
+    bench.reset();
+
+    // The terrain fit has settled the build height.
+    let mut args = args;
+    if !args.mapillary_probe {
+        let new_java_world = (world_format == world_editor::WorldFormat::JavaAnvil)
+            .then_some(generation_path.as_path());
+        if let Err(e) = ground::settle_build_height(
+            &mut args,
+            &ground,
+            &effective_bbox,
+            world_format,
+            &disk_dir,
+            new_java_world,
+        ) {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            // The world made for this run holds nothing yet. A One World is released below.
+            if let (Some(dir), None) = (new_java_world, &args.one_world_run) {
+                let _ = fs::remove_dir_all(dir);
+            }
+            exit_failed();
+        }
+    }
+    let args = args;
+
+    // Parse raw data
+    let (mut parsed_elements, mut xzbbox, outline_suppression, part_groups, housing_parts) =
+        osm_parser::parse_osm_data(
+            raw_data,
+            effective_bbox,
+            args.debug,
+            &projection::ProjectionSpec::from_args(&args),
+        );
+    bench.mark("parse_osm");
+
+    // Merge the Overture buildings now that the OSM elements are parsed.
+    let overture::OvertureData {
+        elements: overture_elements,
+        hints: overture_hints,
+        ..
+    } = overture_data;
+
+    // Fill height/levels on OSM buildings that have neither, before the
+    // footprints are merged (Overture's own ways carry their tags already).
+    let enriched = overture_hints.apply(&mut parsed_elements);
+    if enriched > 0 {
+        println!(
+            "  Filled heights on {} OSM buildings from Overture Maps",
+            enriched.to_string().bright_white().bold()
+        );
+    }
+
+    if !overture_elements.is_empty() {
+        let before_count = parsed_elements.len();
+        let unique_overture =
+            overture::deduplicate_against_osm(overture_elements, &parsed_elements);
+        parsed_elements.extend(unique_overture);
+        let added = parsed_elements.len() - before_count;
+        println!(
+            "  Added {} buildings from Overture Maps",
+            added.to_string().bright_white().bold()
+        );
+    } else if args.overture && !skip_objects && enriched == 0 {
+        println!("  No additional buildings from Overture Maps for this area");
+    }
+
+    osm_parser::sort_by_priority(&mut parsed_elements);
+    bench.mark("sort_priority");
+
+    // OSM water override first, then bridge repair handles remaining bridge-shadow cells.
+    ground.apply_osm_water_override(&parsed_elements, &xzbbox);
+    ground.apply_osm_land_override(&parsed_elements, &xzbbox, args.scale);
+    if args.debug {
+        ground.save_land_cover_debug_image("landcover_debug_post_osm_water");
+    }
+    ground.apply_bridge_land_cover_repair(&parsed_elements, &xzbbox, args.scale);
+    // Last, once the water has stopped moving.
+    ground.finish_land_cover(args.mode);
+    if args.debug {
+        ground.save_land_cover_debug_image("landcover_debug_post_bridge_repair");
+    }
+    bench.mark("landcover_osm_repair");
+
+    // The overrides above still read roads and buildings as land; now the mode drops them.
+    mode_filter::retain_for_mode(&mut parsed_elements, args.mode);
+    let outline_suppression =
+        mode_filter::outline_suppression_for_mode(outline_suppression, args.mode);
+
+    // Write the parsed OSM data to a file for inspection
+    if args.debug {
+        let mut buf = std::io::BufWriter::new(
+            fs::File::create("parsed_osm_data.txt").expect("Failed to create output file"),
+        );
+        for element in &parsed_elements {
+            writeln!(
+                buf,
+                "Element ID: {}, Type: {}, Tags: {:?}",
+                element.id(),
+                element.kind(),
+                element.tags(),
+            )
+            .expect("Failed to write to output file");
+        }
+    }
+
+    // Transform map (parsed_elements). Operations are defined in a json file
+    map_transformation::transform_map(&mut parsed_elements, &mut xzbbox, &mut ground);
+    bench.mark("transform_map");
+
+    // The default spawn is picked in the unrotated area and turned with it, as in the GUI.
+    let pre_rotation_bbox = xzbbox.clone();
+
+    // Apply rotation if specified
+    if args.rotation.abs() > f64::EPSILON {
+        if let Err(e) = map_transformation::rotate::rotate_world(
+            args.rotation,
+            &mut parsed_elements,
+            &mut xzbbox,
+            &mut ground,
+        ) {
+            eprintln!("{} Rotation failed: {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+
+    // Convert spawn lat/lng to Minecraft XZ coordinates if provided
+    let spawn_point: Option<(i32, i32)> = match (args.spawn_lat, args.spawn_lng) {
+        (Some(lat), Some(lng)) => {
+            use coordinate_system::geographic::LLPoint;
+
+            let llpoint = LLPoint::new(lat, lng).unwrap_or_else(|e| {
+                eprintln!("{} Invalid spawn coordinates: {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            });
+
+            let (transformer, pre_rot_bbox) = projection::ProjectionSpec::from_args(&args)
+                .transformer(&effective_bbox)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "{} Failed to convert spawn point: {}",
+                        "Error:".red().bold(),
+                        e
+                    );
+                    std::process::exit(1);
+                });
+
+            let xzpoint = transformer.transform_point(llpoint);
+            let (sx, sz) = map_transformation::rotate::rotate_xz_point(
+                xzpoint.x,
+                xzpoint.z,
+                args.rotation,
+                &pre_rot_bbox,
+            );
+
+            Some((sx, sz))
+        }
+        _ => None,
+    };
+
+    // Derive terrain-aware spawn Y while `ground` is still in scope (it gets
+    // moved into `generate_world_with_options` below). Used only for Java's
+    // post-generation `set_spawn_in_level_dat` call — Bedrock derives spawn Y
+    // independently inside `BedrockWriter::write_level_dat`.
+    //
+    // Without a spawn given, Java starts at the corner of the area like the GUI does. The
+    // level.dat template's own spot lies outside the area: beside it in a flat world, and
+    // over nothing at all in a void one.
+    let java_spawn = spawn_point.or_else(|| {
+        (world_format == world_editor::WorldFormat::JavaAnvil).then(|| {
+            map_transformation::rotate::rotate_xz_point(
+                pre_rotation_bbox.min_x() + 1,
+                pre_rotation_bbox.min_z() + 1,
+                args.rotation,
+                &pre_rotation_bbox,
+            )
+        })
+    });
+    let spawn_y_for_java = java_spawn.map(|(sx, sz)| {
+        use coordinate_system::cartesian::XZPoint;
+        let rel = XZPoint::new(sx - xzbbox.min_x(), sz - xzbbox.min_z());
+        ground.level(rel) + 3
+    });
+
+    // Build generation options
+    let luanti_game = if args.luanti {
+        Some(luanti_block_map::LuantiGame::Mineclonia)
+    } else {
+        None
+    };
+
+    // Probe mode stops here: it exists to answer "is this area covered?" before
+    // anyone waits on a full generation.
+    if args.mapillary_probe {
+        let Some(token) = args.mapillary_token.as_deref().filter(|t| !t.is_empty()) else {
+            eprintln!(
+                "{} --mapillary-probe needs a token; pass --mapillary-token or set MAPILLARY_TOKEN.",
+                "Error:".red().bold()
+            );
+            std::process::exit(1);
+        };
+        let debug_dir = args.mapillary_debug_dir.clone();
+        match mapillary::sample_area(
+            &parsed_elements,
+            &args,
+            effective_bbox,
+            token,
+            debug_dir.is_some(),
+        )
+        .and_then(|report| mapillary::report(&report, debug_dir.as_deref()))
+        {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("{} Mapillary probe failed: {e}", "Error:".red().bold());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Generation places the map item at it; an extended One World moves it only to a marker.
+    let extending = args.one_world_run.as_ref().is_some_and(|r| r.extending);
+    let generation_options = data_processing::GenerationOptions {
+        path: generation_path.clone(),
+        format: world_format,
+        level_name,
+        spawn_point: if extending { spawn_point } else { java_spawn },
+        luanti_game,
+        ground_level: args.ground_level,
+        facades: facade_job,
+    };
+
+    // Generate world
+    match data_processing::generate_world_with_options(
+        parsed_elements,
+        xzbbox,
+        effective_bbox,
+        ground,
+        &args,
+        generation_options,
+        outline_suppression,
+        part_groups,
+        housing_parts,
+    ) {
+        Ok(_) => {
+            if args.bedrock {
+                println!(
+                    "{} Bedrock world saved to: {}",
+                    "Done!".green().bold(),
+                    generation_path.display()
+                );
+            }
+
+            // For Java Edition, write the spawn point into level.dat
+            if world_format == world_editor::WorldFormat::JavaAnvil && !extending {
+                if let (Some((spawn_x, spawn_z)), Some(spawn_y)) = (java_spawn, spawn_y_for_java) {
+                    if let Err(e) = world_utils::set_spawn_in_level_dat(
+                        &generation_path,
+                        spawn_x,
+                        spawn_y,
+                        spawn_z,
+                    ) {
+                        eprintln!(
+                            "{} Failed to set spawn point in level.dat: {}",
+                            "Warning:".yellow().bold(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            exit_failed();
+        }
+    }
+    release_one_world(false);
+}
+
+fn main() {
+    #[cfg(target_os = "windows")]
+    attach_parent_console();
+
+    // Only run CLI mode if the user supplied args.
+    #[cfg(feature = "gui")]
+    {
+        let gui_mode = std::env::args().len() == 1; // Just "arnis" with no args
+        if gui_mode {
+            #[cfg(target_os = "linux")]
+            let user_rendering_override = has_user_rendering_override();
+
+            if let Err(e) = gui::run_gui() {
+                #[cfg(target_os = "linux")]
+                {
+                    let already_retried = env::var_os(EGL_ZINK_RETRY_MARKER).is_some();
+                    if !already_retried && !user_rendering_override && is_egl_startup_failure(&e) {
+                        eprintln!(
+                            "{} Linux EGL initialization failed; retrying once with zink.",
+                            "Warning:".yellow().bold()
+                        );
+                        if let Err(retry_error) = retry_gui_with_zink() {
+                            eprintln!("{} {}", "Error:".red().bold(), retry_error);
+                        }
+                    }
+                }
+
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+
+            return;
+        }
+    }
+
+    run_cli();
+}

@@ -1,0 +1,18 @@
+# Gradle and test runs
+mod/.gradle/
+mod/build/
+mod/run/
+mod/*.log
+
+# Rust build output and the built library (tools/build-native.ps1 makes it)
+native/target/
+native/arnis/target/
+native/*.log
+mod/src/main/resources/natives/
+
+# Upstream Arnis history, kept locally to diff our changes against
+native/arnis-upstream.git/
+
+.idea/
+*.iml
+.vscode/
