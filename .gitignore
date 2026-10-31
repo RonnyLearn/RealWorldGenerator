@@ -16,3 +16,6 @@ native/arnis-upstream.git/
 .idea/
 *.iml
 .vscode/
+
+# Release copies of the built mod
+release/

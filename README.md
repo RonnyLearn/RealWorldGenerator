@@ -1,61 +1,63 @@
-# Real World Generator — мод для Minecraft 26.3 (Fabric)
+# Real World Generator — a Minecraft 26.3 mod (Fabric)
 
-Кнопка **«Реальный мир»** в главном меню. За ней:
+A **Real World** button in the main menu. Behind it:
 
-- **Библиотека** созданных миров: карточки с фотографией района сверху, местом, датой, площадью,
-  размером на диске и значками настроек. Поиск, переименование, удаление, открытие папки.
-- **Карта выбора местности** (OpenStreetMap / рельеф / спутник): поиск города или адреса с плавным
-  перелётом, выделение района правой кнопкой мыши (или Shift + левая), ручки для изменения размера,
-  перенос рамки, сетка чанков, линейка масштаба, точка появления, быстрые квадраты 500 м / 1 км / 2 км.
-  Сбоку настройки мира и оценка, сколько займёт генерация.
-- **Генерация внутри игры**: мир строит [Arnis](https://github.com/louis-e/arnis), встроенный в мод как
-  нативная библиотека. Отдельной программы или процесса нет.
-- **Экран создания**: карта района в изометрии, на которой по ходу генерации появляется
-  настоящий построенный город. Большие районы строятся частями, остановленную генерацию можно
-  достроить позже. Рядом список этапов, прогресс, оставшееся время и остановка.
-- **Вход в мир**: куда (спавн, где был в прошлый раз или любая точка на карте района) и как (режим игры,
-  время суток, включая «как там сейчас» по солнцу этого места, погода, кинематографичный влёт камеры).
-  Во время влёта мод сам снимает фото района сверху для библиотеки и иконки мира.
+- **Library** of your generated worlds: cards with an aerial photo of the area, place, date, size,
+  disk usage and setting badges. Search, rename, delete, open folder.
+- **Area picker map** (OpenStreetMap / terrain / satellite): search for a city or address with a smooth
+  flight to it, select an area with the right mouse button (or Shift + left), resize handles, move the
+  frame, chunk grid, scale bar, spawn point, quick 500 m / 1 km / 2 km squares. World settings and an
+  estimate of how long generation will take are on the side.
+- **In-game generation**: the world is built by [Arnis](https://github.com/louis-e/arnis), embedded in
+  the mod as a native library. No separate program or process.
+- **Generation screen**: an isometric map of the area on which the real city appears as it is built.
+  Large areas are built in pieces; a stopped generation can be finished later. Stage list, progress,
+  time left and a stop button alongside.
+- **Entering the world**: where (spawn, where you left, or any point on the area map) and how (game mode,
+  time of day, including "as it is there now" from the local sun, weather, cinematic camera fly-in,
+  chunk preloading). During the fly-in the mod takes an aerial photo for the library and the world icon.
 
-## Структура
+## Layout
 
 ```
 RealWorld/
-├─ mod/                      исходники мода (Fabric, Java 25)
+├─ mod/                      mod sources (Fabric, Java 25)
 │  └─ src/main/java/net/ronnylearn/realworld/
-│     ├─ RealWorldMod.java    точка входа, события
-│     ├─ RealWorldConfig.java запоминание карты и настроек
-│     ├─ arnis/               мост к Arnis (Java FFM) и задача генерации
-│     ├─ geo/                 координаты и проекция Web Mercator
-│     ├─ map/                 тайлы, поиск мест, виджет карты, снимок района
-│     ├─ screen/              экраны: библиотека, карта, генерация, вход, переименование
-│     ├─ world/               метаданные миров, библиотека, план входа, влёт камеры и фото
-│     ├─ mixin/               камера (влёт) и скрытое окно для автотеста
-│     └─ dev/SelfTest.java    автотест (работает только при rw-selftest.flag)
-├─ native/arnis/             Arnis 3.3.0 + обёртка для встраивания
-│  ├─ src/lib.rs              библиотека вместо программы
-│  ├─ src/embedded.rs         генерация без выхода из процесса + функции для Java
-│  └─ src/embedded_progress.rs прогресс для игры вместо окна Tauri
+│     ├─ RealWorldMod.java    entry point, events
+│     ├─ RealWorldConfig.java remembered map position and settings
+│     ├─ arnis/               bridge to Arnis (Java FFM) and the generation task
+│     ├─ geo/                 coordinates and Web Mercator projection
+│     ├─ map/                 tiles, place search, map widget, area snapshot
+│     ├─ screen/              screens: library, map, generation, entry, rename
+│     ├─ world/               world metadata, library, entry plan, camera fly-in and photo
+│     ├─ mixin/               camera (fly-in) and a hidden window for the self-test
+│     └─ dev/SelfTest.java    self-test (only runs when rw-selftest.flag exists)
+├─ native/arnis/             Arnis 3.3.0 + the embedding wrapper
+│  ├─ src/lib.rs              library instead of a program
+│  ├─ src/embedded.rs         generation without leaving the process + functions for Java
+│  └─ src/embedded_progress.rs progress for the game instead of the Tauri window
 └─ tools/
-   ├─ build-native.ps1        собрать arnis_native.dll и положить в ресурсы мода
-   └─ selftest.ps1            скрытый автотест в фоне (без звука, низкий приоритет)
+   ├─ build-native.ps1        build arnis_native.dll into the mod's resources
+   └─ selftest.ps1            hidden background self-test (muted, low priority)
 ```
 
-## Сборка
+## Building
 
-1. `tools\build-native.ps1`: собирает `arnis_native.dll` (Rust в `D:\Tools\rust`, MSVC Build Tools),
-   около 10 минут в первый раз. Готовая библиотека в репозитории не хранится.
-2. В `mod\` выполнить `gradlew build`. Готовый мод: `mod\build\libs\real-world-generator-1.0.0.jar`.
+1. `tools\build-native.ps1` builds `arnis_native.dll` (needs Rust and MSVC Build Tools; the script
+   expects Rust in `D:\Tools\rust`). About 10 minutes the first time. The built library is not
+   stored in the repository.
+2. In `mod\` run `gradlew build`. The mod: `mod\build\libs\real-world-generator-1.0.0.jar`.
 
-Нужны Minecraft 26.3, Fabric Loader ≥ 0.19.3, Fabric API и Windows x64: библиотека Arnis собрана
-под Windows.
+Requires Minecraft 26.3, Fabric Loader ≥ 0.19.3, Fabric API and Windows x64 (the Arnis library is
+built for Windows).
 
-## Лицензии и данные
+## Licenses and data
 
-- Real World Generator © RonnyLearn, все права защищены (All Rights Reserved), см. `LICENSE`.
-  Копировать, изменять и выкладывать мод или его код без разрешения автора нельзя.
-- Включает Arnis © Louis Erbkamm (Apache-2.0, с изменениями), папка `native/arnis` остаётся под этой
-  лицензией. Файлы `LICENSE` и `NOTICE` Arnis лежат в jar
-  (`META-INF/licenses/arnis`). Изменения в коде Arnis помечены комментарием «Real World mod».
-- Карта и данные: © OpenStreetMap contributors (ODbL). Рельеф: © OpenTopoMap (CC-BY-SA).
-  Спутник: © Esri, Maxar, Earthstar Geographics. Поиск мест: Nominatim (не чаще раза в секунду).
+- Real World Generator © RonnyLearn, All Rights Reserved, see `LICENSE`. Copying, modifying or
+  redistributing the mod or its code without the author's permission is not allowed.
+- Includes Arnis © Louis Erbkamm (Apache License 2.0, with changes); the `native/arnis` directory stays
+  under that license. Arnis's `LICENSE` and `NOTICE` ship inside the jar (`META-INF/licenses/arnis`).
+  Changes to Arnis code are marked with a "Real World mod" comment.
+- Map data © OpenStreetMap contributors (ODbL). Terrain map © OpenTopoMap (CC-BY-SA).
+  Satellite imagery © Esri, Maxar, Earthstar Geographics. Place search: Nominatim (at most one
+  request per second).
